@@ -2,23 +2,26 @@ import copy
 import json
 import os
 import warnings
-from absl import app, flags
+from pathlib import Path
 
 import torch
+from absl import app, flags
+from PIL import Image
 from tensorboardX import SummaryWriter
+from torch.utils.data import Dataset
+from torchvision import transforms
 from torchvision.datasets import CIFAR10
 from torchvision.utils import make_grid, save_image
-from torchvision import transforms
 from tqdm import trange
 
-from diffusion import GaussianDiffusionTrainer, GaussianDiffusionSampler
+from diffusion import GaussianDiffusionSampler, GaussianDiffusionTrainer
 from model import UNet
 from score.both import get_inception_and_fid_score
-
 
 FLAGS = flags.FLAGS
 flags.DEFINE_bool('train', False, help='train from scratch')
 flags.DEFINE_bool('eval', False, help='load model.pt and evaluate FID and IS')
+flags.DEFINE_string('data_path', None, help='path to the image directory')
 # UNet
 flags.DEFINE_integer('ch', 128, help='base channel of UNet')
 flags.DEFINE_multi_integer('ch_mult', [1, 2, 2, 2], help='channel multiplier')
@@ -29,8 +32,12 @@ flags.DEFINE_float('dropout', 0.1, help='dropout rate of resblock')
 flags.DEFINE_float('beta_1', 1e-4, help='start beta value')
 flags.DEFINE_float('beta_T', 0.02, help='end beta value')
 flags.DEFINE_integer('T', 1000, help='total diffusion steps')
-flags.DEFINE_enum('mean_type', 'epsilon', ['xprev', 'xstart', 'epsilon'], help='predict variable')
-flags.DEFINE_enum('var_type', 'fixedlarge', ['fixedlarge', 'fixedsmall'], help='variance type')
+flags.DEFINE_enum('mean_type',
+                  'epsilon', ['xprev', 'xstart', 'epsilon'],
+                  help='predict variable')
+flags.DEFINE_enum('var_type',
+                  'fixedlarge', ['fixedlarge', 'fixedsmall'],
+                  help='variance type')
 # Training
 flags.DEFINE_float('lr', 2e-4, help='target learning rate')
 flags.DEFINE_float('grad_clip', 1., help="gradient norm clipping")
@@ -46,9 +53,17 @@ flags.DEFINE_string('logdir', './logs/DDPM_CIFAR10_EPS', help='log directory')
 flags.DEFINE_integer('sample_size', 64, "sampling size of images")
 flags.DEFINE_integer('sample_step', 1000, help='frequency of sampling')
 # Evaluation
-flags.DEFINE_integer('save_step', 5000, help='frequency of saving checkpoints, 0 to disable during training')
-flags.DEFINE_integer('eval_step', 0, help='frequency of evaluating model, 0 to disable during training')
-flags.DEFINE_integer('num_images', 50000, help='the number of generated images for evaluation')
+flags.DEFINE_integer(
+    'save_step',
+    5000,
+    help='frequency of saving checkpoints, 0 to disable during training')
+flags.DEFINE_integer(
+    'eval_step',
+    0,
+    help='frequency of evaluating model, 0 to disable during training')
+flags.DEFINE_integer('num_images',
+                     50000,
+                     help='the number of generated images for evaluation')
 flags.DEFINE_bool('fid_use_torch', False, help='calculate IS and FID on gpu')
 flags.DEFINE_string('fid_cache', './stats/cifar10_train.npz', help='FID cache')
 
@@ -59,14 +74,13 @@ def ema(source, target, decay):
     source_dict = source.state_dict()
     target_dict = target.state_dict()
     for key in source_dict.keys():
-        target_dict[key].data.copy_(
-            target_dict[key].data * decay +
-            source_dict[key].data * (1 - decay))
+        target_dict[key].data.copy_(target_dict[key].data * decay +
+                                    source_dict[key].data * (1 - decay))
 
 
 def infiniteloop(dataloader):
     while True:
-        for x, y in iter(dataloader):
+        for x in iter(dataloader):
             yield x
 
 
@@ -86,48 +100,95 @@ def evaluate(sampler, model):
             images.append((batch_images + 1) / 2)
         images = torch.cat(images, dim=0).numpy()
     model.train()
-    (IS, IS_std), FID = get_inception_and_fid_score(
-        images, FLAGS.fid_cache, num_images=FLAGS.num_images,
-        use_torch=FLAGS.fid_use_torch, verbose=True)
+    (IS,
+     IS_std), FID = get_inception_and_fid_score(images,
+                                                FLAGS.fid_cache,
+                                                num_images=FLAGS.num_images,
+                                                use_torch=FLAGS.fid_use_torch,
+                                                verbose=True)
     return (IS, IS_std), FID, images
+
+
+def make_cifar():
+    # legacy code from the github
+    dataset = CIFAR10(root='./data',
+                      train=True,
+                      download=True,
+                      transform=transforms.Compose([
+                          transforms.RandomHorizontalFlip(),
+                          transforms.ToTensor(),
+                          transforms.Normalize((0.5, 0.5, 0.5),
+                                               (0.5, 0.5, 0.5)),
+                      ]))
+    return dataset
+
+
+class ImageDataset(Dataset):
+    def __init__(self, folder, image_size, exts=['jpg', 'jpeg', 'png']):
+        super().__init__()
+        self.folder = folder
+        self.image_size = image_size
+        self.paths = [
+            p for ext in exts for p in Path(f'{folder}').glob(f'**/*.{ext}')
+        ]
+
+        self.transform = transforms.Compose([
+            transforms.Resize(image_size),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, index):
+        path = self.paths[index]
+        img = Image.open(path)
+        return self.transform(img)
 
 
 def train():
     # dataset
-    dataset = CIFAR10(
-        root='./data', train=True, download=True,
-        transform=transforms.Compose([
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-        ]))
-    dataloader = torch.utils.data.DataLoader(
-        dataset, batch_size=FLAGS.batch_size, shuffle=True,
-        num_workers=FLAGS.num_workers, drop_last=True)
+    print('data_path:', FLAGS.data_path)
+    dataset = ImageDataset(folder=FLAGS.data_path, image_size=FLAGS.img_size)
+    dataloader = torch.utils.data.DataLoader(dataset,
+                                             batch_size=FLAGS.batch_size,
+                                             shuffle=True,
+                                             num_workers=FLAGS.num_workers,
+                                             drop_last=True)
     datalooper = infiniteloop(dataloader)
 
     # model setup
-    net_model = UNet(
-        T=FLAGS.T, ch=FLAGS.ch, ch_mult=FLAGS.ch_mult, attn=FLAGS.attn,
-        num_res_blocks=FLAGS.num_res_blocks, dropout=FLAGS.dropout)
+    net_model = UNet(T=FLAGS.T,
+                     ch=FLAGS.ch,
+                     ch_mult=FLAGS.ch_mult,
+                     attn=FLAGS.attn,
+                     num_res_blocks=FLAGS.num_res_blocks,
+                     dropout=FLAGS.dropout)
     ema_model = copy.deepcopy(net_model)
     optim = torch.optim.Adam(net_model.parameters(), lr=FLAGS.lr)
     sched = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=warmup_lr)
-    trainer = GaussianDiffusionTrainer(
-        net_model, FLAGS.beta_1, FLAGS.beta_T, FLAGS.T).to(device)
-    net_sampler = GaussianDiffusionSampler(
-        net_model, FLAGS.beta_1, FLAGS.beta_T, FLAGS.T, FLAGS.img_size,
-        FLAGS.mean_type, FLAGS.var_type).to(device)
-    ema_sampler = GaussianDiffusionSampler(
-        ema_model, FLAGS.beta_1, FLAGS.beta_T, FLAGS.T, FLAGS.img_size,
-        FLAGS.mean_type, FLAGS.var_type).to(device)
+    trainer = GaussianDiffusionTrainer(net_model, FLAGS.beta_1, FLAGS.beta_T,
+                                       FLAGS.T).to(device)
+    net_sampler = GaussianDiffusionSampler(net_model, FLAGS.beta_1,
+                                           FLAGS.beta_T, FLAGS.T,
+                                           FLAGS.img_size, FLAGS.mean_type,
+                                           FLAGS.var_type).to(device)
+    ema_sampler = GaussianDiffusionSampler(ema_model, FLAGS.beta_1,
+                                           FLAGS.beta_T, FLAGS.T,
+                                           FLAGS.img_size, FLAGS.mean_type,
+                                           FLAGS.var_type).to(device)
     if FLAGS.parallel:
         trainer = torch.nn.DataParallel(trainer)
         net_sampler = torch.nn.DataParallel(net_sampler)
         ema_sampler = torch.nn.DataParallel(ema_sampler)
 
     # log setup
-    os.makedirs(os.path.join(FLAGS.logdir, 'sample'))
+    sample_dir = os.path.join(FLAGS.logdir, 'sample')
+    if not os.path.exists(sample_dir):
+        os.makedirs(sample_dir)
+
     x_T = torch.randn(FLAGS.sample_size, 3, FLAGS.img_size, FLAGS.img_size)
     x_T = x_T.to(device)
     grid = (make_grid(next(iter(dataloader))[0][:FLAGS.sample_size]) + 1) / 2
@@ -151,8 +212,8 @@ def train():
             x_0 = next(datalooper).to(device)
             loss = trainer(x_0).mean()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                net_model.parameters(), FLAGS.grad_clip)
+            torch.nn.utils.clip_grad_norm_(net_model.parameters(),
+                                           FLAGS.grad_clip)
             optim.step()
             sched.step()
             ema(net_model, ema_model, FLAGS.ema_decay)
@@ -167,8 +228,8 @@ def train():
                 with torch.no_grad():
                     x_0 = ema_sampler(x_T)
                     grid = (make_grid(x_0) + 1) / 2
-                    path = os.path.join(
-                        FLAGS.logdir, 'sample', '%d.png' % step)
+                    path = os.path.join(FLAGS.logdir, 'sample',
+                                        '%d.png' % step)
                     save_image(grid, path)
                     writer.add_image('sample', grid, step)
                 net_model.train()
@@ -197,9 +258,9 @@ def train():
                     'IS_std_EMA': ema_IS[1],
                     'FID_EMA': ema_FID
                 }
-                pbar.write(
-                    "%d/%d " % (step, FLAGS.total_steps) +
-                    ", ".join('%s:%.3f' % (k, v) for k, v in metrics.items()))
+                pbar.write("%d/%d " % (step, FLAGS.total_steps) +
+                           ", ".join('%s:%.3f' % (k, v)
+                                     for k, v in metrics.items()))
                 for name, value in metrics.items():
                     writer.add_scalar(name, value, step)
                 writer.flush()
@@ -211,12 +272,19 @@ def train():
 
 def eval():
     # model setup
-    model = UNet(
-        T=FLAGS.T, ch=FLAGS.ch, ch_mult=FLAGS.ch_mult, attn=FLAGS.attn,
-        num_res_blocks=FLAGS.num_res_blocks, dropout=FLAGS.dropout)
-    sampler = GaussianDiffusionSampler(
-        model, FLAGS.beta_1, FLAGS.beta_T, FLAGS.T, img_size=FLAGS.img_size,
-        mean_type=FLAGS.mean_type, var_type=FLAGS.var_type).to(device)
+    model = UNet(T=FLAGS.T,
+                 ch=FLAGS.ch,
+                 ch_mult=FLAGS.ch_mult,
+                 attn=FLAGS.attn,
+                 num_res_blocks=FLAGS.num_res_blocks,
+                 dropout=FLAGS.dropout)
+    sampler = GaussianDiffusionSampler(model,
+                                       FLAGS.beta_1,
+                                       FLAGS.beta_T,
+                                       FLAGS.T,
+                                       img_size=FLAGS.img_size,
+                                       mean_type=FLAGS.mean_type,
+                                       var_type=FLAGS.var_type).to(device)
     if FLAGS.parallel:
         sampler = torch.nn.DataParallel(sampler)
 
@@ -225,18 +293,16 @@ def eval():
     model.load_state_dict(ckpt['net_model'])
     (IS, IS_std), FID, samples = evaluate(sampler, model)
     print("Model     : IS:%6.3f(%.3f), FID:%7.3f" % (IS, IS_std, FID))
-    save_image(
-        torch.tensor(samples[:256]),
-        os.path.join(FLAGS.logdir, 'samples.png'),
-        nrow=16)
+    save_image(torch.tensor(samples[:256]),
+               os.path.join(FLAGS.logdir, 'samples.png'),
+               nrow=16)
 
     model.load_state_dict(ckpt['ema_model'])
     (IS, IS_std), FID, samples = evaluate(sampler, model)
     print("Model(EMA): IS:%6.3f(%.3f), FID:%7.3f" % (IS, IS_std, FID))
-    save_image(
-        torch.tensor(samples[:256]),
-        os.path.join(FLAGS.logdir, 'samples_ema.png'),
-        nrow=16)
+    save_image(torch.tensor(samples[:256]),
+               os.path.join(FLAGS.logdir, 'samples_ema.png'),
+               nrow=16)
 
 
 def main(argv):

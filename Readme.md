@@ -7,6 +7,11 @@ implementation [2]. I use PyTorch coding style to port [2] to PyTorch and hope
 that anyone who is familiar with PyTorch can easily understand every
 implementation details.
 
+## To train with FFHQ
+
+The dataset will read images from `./data/ffhq_256/train`
+
+
 ## TODO
 - Datasets
     - [x] Support CIFAR10

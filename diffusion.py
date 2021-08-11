@@ -39,7 +39,8 @@ class GaussianDiffusionTrainer(nn.Module):
         x_t = (
             extract(self.sqrt_alphas_bar, t, x_0.shape) * x_0 +
             extract(self.sqrt_one_minus_alphas_bar, t, x_0.shape) * noise)
-        loss = F.mse_loss(self.model(x_t, t), noise, reduction='none')
+        out, _ = self.model(x_t, t)
+        loss = F.mse_loss(out, noise, reduction='none')
         return loss
 
 
@@ -129,21 +130,21 @@ class GaussianDiffusionSampler(nn.Module):
 
         # Mean parameterization
         if self.mean_type == 'xprev':       # the model predicts x_{t-1}
-            x_prev = self.model(x_t, t)
+            x_prev, interm = self.model(x_t, t)
             x_0 = self.predict_xstart_from_xprev(x_t, t, xprev=x_prev)
             model_mean = x_prev
         elif self.mean_type == 'xstart':    # the model predicts x_0
-            x_0 = self.model(x_t, t)
+            x_0, interm = self.model(x_t, t)
             model_mean, _ = self.q_mean_variance(x_0, x_t, t)
         elif self.mean_type == 'epsilon':   # the model predicts epsilon
-            eps = self.model(x_t, t)
+            eps, interm = self.model(x_t, t)
             x_0 = self.predict_xstart_from_eps(x_t, t, eps=eps)
             model_mean, _ = self.q_mean_variance(x_0, x_t, t)
         else:
             raise NotImplementedError(self.mean_type)
         x_0 = torch.clip(x_0, -1., 1.)
 
-        return model_mean, model_log_var
+        return model_mean, model_log_var, interm
 
     def forward(self, x_T):
         """
@@ -152,7 +153,7 @@ class GaussianDiffusionSampler(nn.Module):
         x_t = x_T
         for time_step in reversed(range(self.T)):
             t = x_t.new_ones([x_T.shape[0], ], dtype=torch.long) * time_step
-            mean, log_var = self.p_mean_variance(x_t=x_t, t=t)
+            mean, log_var, interm = self.p_mean_variance(x_t=x_t, t=t)
             # no noise when t == 0
             if time_step > 0:
                 noise = torch.randn_like(x_t)
