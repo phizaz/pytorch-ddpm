@@ -215,7 +215,7 @@ class UNet(nn.Module):
         init.xavier_uniform_(self.tail[-1].weight, gain=1e-5)
         init.zeros_(self.tail[-1].bias)
 
-    def forward(self, x, t, return_interms=False):
+    def forward(self, x, t, return_interm=False):
         # Timestep embedding
         temb = self.time_embedding(t)
         # Downsampling
@@ -229,7 +229,7 @@ class UNet(nn.Module):
             h = layer(h, temb)
 
         interm = []
-        if return_interms:
+        if return_interm:
             interm.append(h)
 
         # Upsampling
@@ -240,18 +240,18 @@ class UNet(nn.Module):
             _, _, HH, WW = new_h.shape
             _, _, H, W = h.shape
 
-            if return_interms and (HH, WW) != (H, W):
+            if return_interm and (HH, WW) != (H, W):
                 # print((HH, WW), (H, W))
                 interm.append(h)
 
             h = new_h
 
-        if return_interms:
+        if return_interm:
             interm.append(h)
 
         h = self.tail(h)
 
-        if return_interms:
+        if return_interm:
             interm.append(h)
 
         assert len(hs) == 0
