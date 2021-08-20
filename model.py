@@ -54,7 +54,7 @@ class DownSample(nn.Module):
         init.xavier_uniform_(self.main.weight)
         init.zeros_(self.main.bias)
 
-    def forward(self, x, temb):
+    def forward(self, x, **kwargs):
         x = self.main(x)
         return x
 
@@ -69,7 +69,7 @@ class UpSample(nn.Module):
         init.xavier_uniform_(self.main.weight)
         init.zeros_(self.main.bias)
 
-    def forward(self, x, temb):
+    def forward(self, x, **kwargs):
         _, _, H, W = x.shape
         x = F.interpolate(x, scale_factor=2, mode='nearest')
         x = self.main(x)
@@ -115,17 +115,18 @@ class AttnBlock(nn.Module):
 
 
 class ResBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, tdim, dropout, attn=False):
+    def __init__(self, in_ch, out_ch, tdim=None, dropout=None, attn=False):
         super().__init__()
         self.block1 = nn.Sequential(
             nn.GroupNorm(32, in_ch),
             Swish(),
             nn.Conv2d(in_ch, out_ch, 3, stride=1, padding=1),
         )
-        self.temb_proj = nn.Sequential(
-            Swish(),
-            nn.Linear(tdim, out_ch),
-        )
+        if tdim is not None:
+            self.temb_proj = nn.Sequential(
+                Swish(),
+                nn.Linear(tdim, out_ch),
+            )
         self.block2 = nn.Sequential(
             nn.GroupNorm(32, out_ch),
             Swish(),
@@ -149,9 +150,10 @@ class ResBlock(nn.Module):
                 init.zeros_(module.bias)
         init.xavier_uniform_(self.block2[-1].weight, gain=1e-5)
 
-    def forward(self, x, temb):
+    def forward(self, x, temb=None):
         h = self.block1(x)
-        h += self.temb_proj(temb)[:, :, None, None]
+        if temb is not None:
+            h += self.temb_proj(temb)[:, :, None, None]
         h = self.block2(h)
 
         h = h + self.shortcut(x)
@@ -222,11 +224,11 @@ class UNet(nn.Module):
         h = self.head(x)
         hs = [h]
         for layer in self.downblocks:
-            h = layer(h, temb)
+            h = layer(h, temb=temb)
             hs.append(h)
         # Middle
         for layer in self.middleblocks:
-            h = layer(h, temb)
+            h = layer(h, temb=temb)
 
         interm = []
         if return_interm:
@@ -236,7 +238,7 @@ class UNet(nn.Module):
         for layer in self.upblocks:
             if isinstance(layer, ResBlock):
                 h = torch.cat([h, hs.pop()], dim=1)
-            new_h = layer(h, temb)
+            new_h = layer(h, temb=temb)
             _, _, HH, WW = new_h.shape
             _, _, H, W = h.shape
 

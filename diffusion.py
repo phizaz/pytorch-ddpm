@@ -37,7 +37,7 @@ class GaussianDiffusionTrainer(nn.Module):
         noise = torch.randn_like(x_0)
         x_t = (extract(self.sqrt_alphas_bar, t, x_0.shape) * x_0 +
                extract(self.sqrt_one_minus_alphas_bar, t, x_0.shape) * noise)
-        out, _ = self.model(x_t, t)
+        out, _ = self.model(x_t, t, x_0=x_0)
         loss = F.mse_loss(out, noise, reduction='none')
         return loss
 
@@ -49,9 +49,10 @@ class GaussianDiffusionSampler(nn.Module):
                  beta_T,
                  T,
                  img_size=32,
-                 mean_type='eps',
+                 mean_type=None,
                  var_type='fixedlarge'):
-        assert mean_type in ['xprev' 'xstart', 'epsilon']
+        assert mean_type in ['xprev', 'xstart',
+                             'epsilon'], f'mean_type: {mean_type}'
         assert var_type in ['fixedlarge', 'fixedsmall']
         super().__init__()
 
@@ -115,7 +116,7 @@ class GaussianDiffusionSampler(nn.Module):
             extract(self.posterior_mean_coef2 / self.posterior_mean_coef1, t,
                     x_t.shape) * x_t)
 
-    def p_mean_variance(self, x_t, t, return_interm=False):
+    def p_mean_variance(self, x_t, t, return_interm=False, **kwargs):
         # below: only log_variance is used in the KL computations
         model_log_var = {
             # for fixedlarge, we set the initial (log-)variance like so to
@@ -129,14 +130,23 @@ class GaussianDiffusionSampler(nn.Module):
 
         # Mean parameterization
         if self.mean_type == 'xprev':  # the model predicts x_{t-1}
-            x_prev, interm = self.model(x_t, t, return_interm=return_interm)
+            x_prev, interm = self.model(x_t,
+                                        t,
+                                        return_interm=return_interm,
+                                        **kwargs)
             x_0 = self.predict_xstart_from_xprev(x_t, t, xprev=x_prev)
             model_mean = x_prev
         elif self.mean_type == 'xstart':  # the model predicts x_0
-            x_0, interm = self.model(x_t, t, return_interm=return_interm)
+            x_0, interm = self.model(x_t,
+                                     t,
+                                     return_interm=return_interm,
+                                     **kwargs)
             model_mean, _ = self.q_mean_variance(x_0, x_t, t)
         elif self.mean_type == 'epsilon':  # the model predicts epsilon
-            eps, interm = self.model(x_t, t, return_interm=return_interm)
+            eps, interm = self.model(x_t,
+                                     t,
+                                     return_interm=return_interm,
+                                     **kwargs)
             x_0 = self.predict_xstart_from_eps(x_t, t, eps=eps)
             model_mean, _ = self.q_mean_variance(x_0, x_t, t)
         else:
@@ -145,7 +155,7 @@ class GaussianDiffusionSampler(nn.Module):
 
         return model_mean, model_log_var, x_0, interm
 
-    def forward(self, x_T):
+    def forward(self, x_T, x_0=None):
         """
         Algorithm 2.
         """
@@ -155,7 +165,8 @@ class GaussianDiffusionSampler(nn.Module):
                 x_T.shape[0],
             ], dtype=torch.long) * time_step
             mean, log_var, interm_x0, interm = self.p_mean_variance(x_t=x_t,
-                                                                    t=t)
+                                                                    t=t,
+                                                                    x_0=x_0)
             # no noise when t == 0
             if time_step > 0:
                 noise = torch.randn_like(x_t)

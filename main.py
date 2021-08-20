@@ -16,6 +16,7 @@ from tqdm import trange
 
 from diffusion import GaussianDiffusionSampler, GaussianDiffusionTrainer
 from model import UNet
+from model_our import StyleUNet
 from score.both import get_inception_and_fid_score
 
 FLAGS = flags.FLAGS
@@ -160,12 +161,20 @@ def train():
     datalooper = infiniteloop(dataloader)
 
     # model setup
-    net_model = UNet(T=FLAGS.T,
-                     ch=FLAGS.ch,
-                     ch_mult=FLAGS.ch_mult,
-                     attn=FLAGS.attn,
-                     num_res_blocks=FLAGS.num_res_blocks,
-                     dropout=FLAGS.dropout)
+    # net_model = UNet(T=FLAGS.T,
+    #                  ch=FLAGS.ch,
+    #                  ch_mult=FLAGS.ch_mult,
+    #                  attn=FLAGS.attn,
+    #                  num_res_blocks=FLAGS.num_res_blocks,
+    #                  dropout=FLAGS.dropout)
+    net_model = StyleUNet(T=FLAGS.T,
+                          ch=FLAGS.ch,
+                          ch_mult=FLAGS.ch_mult,
+                          attn=FLAGS.attn,
+                          num_res_blocks=FLAGS.num_res_blocks,
+                          dropout=FLAGS.dropout,
+                          style_ch=512)
+
     ema_model = copy.deepcopy(net_model)
     optim = torch.optim.Adam(net_model.parameters(), lr=FLAGS.lr)
     sched = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=warmup_lr)
@@ -226,7 +235,8 @@ def train():
             if FLAGS.sample_step > 0 and step % FLAGS.sample_step == 0:
                 net_model.eval()
                 with torch.no_grad():
-                    x_0 = ema_sampler(x_T)
+                    # NOTE: cannot generate from nothing
+                    x_0 = ema_sampler(x_T, x_0=x_0)
                     grid = (make_grid(x_0) + 1) / 2
                     path = os.path.join(FLAGS.logdir, 'sample',
                                         '%d.png' % step)
